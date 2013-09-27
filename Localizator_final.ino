@@ -41,7 +41,7 @@ volatile int16_t  x_r[CHANNELS][FFT_SIZE];        // MEM: 512 Bytes
 
          int16_t  faza[2][MIRROR];                // DEBUG 
 
-volatile uint8_t  flagSamp    =  0;
+volatile uint8_t  flagSamp    =  0;  // Flag signaling sampling break
          uint8_t  directin    =  0;               // X - Y Dimension.   
          uint8_t  indxUpdt    =  0;
 const    uint8_t  srvoAccl[2] = { 2, 1};          // Filter's responsivnes adjustment ( 1 is slowest).
@@ -320,19 +320,24 @@ void fft_radix4_I( int *fr, int *fi, int ldn)
     }
 }
 
+// Sets up sampling and waits for it to happen. Also does hamming window filtering. 
 void take_it( uint8_t direct )
 {
+  // Sets up ADC for proper microphones (2 each iteration)
    ADMUX  &= 0xFC;
    ADMUX  |= (direct << 1);                        // 0 & 1 - Horizontal. 2 & 3 - Vertical
 
+// Set up timer to call timer interrupt and do actual sampling
    OCR0A   = SMPLTIME;
    TCNT0   = 0;
    TIFR0  |= (1<<OCF0A); 
    TIMSK0 |= (1<<OCIE0A);
 
+// Wait for sampling to finish
   flagSamp = 0;   
   while ( !flagSamp );
 
+// Fixes negative numbers and does the hamming filtering
   for ( uint8_t y = 0; y < CHANNELS; y++){
     for ( uint16_t i = 0; i < FFT_SIZE; i++){
       if ( x_r[y][i] & 0x0200) x_r[y][i] += 0xFC00; // Convert to negative 16-bit word (2's comp)    
@@ -341,13 +346,17 @@ void take_it( uint8_t direct )
     }
 }
 
+// Timer Interrupt hook
 ISR(TIMER0_COMPA_vect) 
 {
+
   static   uint8_t n_sampl = 0;
   static   uint8_t n_chanl = 0;
     
+    //Store value from ADC
    x_r[n_chanl][n_sampl]  = ADC; 
 
+// Update indices for  next  microphone and sample #
    if ( n_chanl )  n_sampl++;
    n_chanl = !n_chanl;
 
@@ -356,6 +365,7 @@ ISR(TIMER0_COMPA_vect)
 
    if ( n_sampl >= FFT_SIZE )
    {
+     // Sampling finished, turns off timer and changes flag
      flagSamp = 1;
      n_sampl  = 0;
      n_chanl  = 0;
@@ -439,11 +449,12 @@ void loop()
   char incomingByte;
   int16_t  vremn = 0;  
 
-  if ( directin ) directin = 0;                // X koordinate;
-  else            directin = 1;                // Y koordinate;
+  if ( directin ) directin = 0;                // X coordinate;
+  else            directin = 1;                // Y coordinate;
   
   take_it( directin );                         // SAMPLING
     
+    // Sample is in x_r.  Does FFT and stores into f_r and f_i (real and imaginary parts of the FFT). 
     for ( uint8_t y = 0; y < CHANNELS; y++){
       for ( uint8_t i = 0; i < FFT_SIZE; i++){
        f_r[i] =  x_r[y][i];
@@ -453,33 +464,40 @@ void loop()
      rev_bin( f_r, FFT_SIZE);
      fft_radix4_I( f_r, f_i, LOG_2_FFT);      
      
+     // Extracts phase
      for ( uint8_t i = 0; i < MIRROR; i++){      
         uint16_t  sina,  cosina;
         int16_t   qr, qi, phase = 0, znak = 1;
 
+    // Uses LUT to preform arctan from FFT data
         qr = f_r[i] >> 5;      // DEFAULT gain Reset with FFT_SIZE = 128 ( 128/2 = 64 or 6 bits).
         qi = f_i[i] >> 5;      // Only 5 for now, there is 3.5 bit Limiter in RAINBOW NOICE CANCELER
-
+  
         cosina = abs(qr);
         sina   = abs(qi);
        
+       // Rescaling by factor of 2 in each dimention (real and imaginary), leaving the same angle
         while ((sina > 31) || (cosina > 31))   // Scaling for aTangent LUT.
         {
          sina >>= 1;
          cosina >>= 1;
         }
-
+        
         if(((sina * sina) + (cosina * cosina)) < 256)
           phase = -1;                          // RAINBOW NOICE CANCELER     
         else
          {
+           
+           // Reads angle using LUT
           phase = pgm_read_word(&aTangentc[sina][cosina]);
 
+          // Fixes angle using quadrants
           if((qr < 0) && (qi >  0)) znak   = -1;
           if((qr > 0) && (qi <  0)) znak   = -1;
 
           phase *= znak;
           
+          // Adds or substracts PI, according to quadrant
           if((qr < 0) && (qi <  0)) phase -= 1024;
           if((qr < 0) && (qi >= 0)) phase += 1024;
          }
@@ -487,23 +505,29 @@ void loop()
        }
      }
       
+         // Calcultes a value that is proportional to time differences
+         // Probably when i=0 or 1, the frequency is low (<150Hz)
         for ( uint8_t i = 2; i < MIRROR; i++)  // LIMITS: 150 HZ 
         {                                      // Electrical grid interference, Motor Vibration. 
           vremn = 0;                                       
           if ((x_r[0][i] != -1) && (x_r[1][i] != -1))
           {
-            vremn = x_r[0][i] - x_r[1][i];            
+            // Calculates phase difference
+            vremn = x_r[0][i] - x_r[1][i];    // puts it between -PI to PI        
             if (vremn >  1024) vremn -= 2048;
             if (vremn < -1024) vremn += 2048;
             
+            // Dividing by the frequency to get time difference (up to a constant) 
             vremn = (32 * vremn) / i;                                    
+            // Offsets by 25 microseconds to compensate for different sampling times between the two microphones
             vremn -= 256;                      // MIC Time Offset Correction (1 ADC, 25 usec delay).
-
+           // Filter moves towards the real value
           if (lokaVect[directin][i] < vremn) lokaVect[directin][i] += srvoAccl[directin];
           if (lokaVect[directin][i] > vremn) lokaVect[directin][i] -= srvoAccl[directin];
           }
         }
 
+        // Updates servos periodically (at 50Hz)
         indxUpdt++;
         if ( indxUpdt > updtRate )             // Servo running at 50 Hz, don't have to be updated often ~1/8
         {
@@ -513,8 +537,10 @@ void loop()
                     summa = 0;
             for ( uint8_t i = 2; i < MIRROR; i++)                    
             { 
+              // For debugging purposes
               faza[y][i] = lokaVect[y][i];
 
+              // Takes average only of values that are large enough and manipulates the median filter somehow
               if (abs(lokaVect[y][i]) > 8)     //  2048 / 8 ~= 360 / 256 ~= 1.5 DEGREE
                 {
                   summa += lokaVect[y][i];              
@@ -528,8 +554,9 @@ void loop()
             }
 
            if (count)    summa /= count;
-
-           srvoPosn[y] -= summa;         
+           // Changes servo position according to the average time difference of all frequencies
+           srvoPosn[y] -= summa;    
+          // Moves servo     
            if ( y )
            {
             srvoPosn[y] = constrain( srvoPosn[y], 1500, 2100);        
@@ -540,9 +567,13 @@ void loop()
             srvoPosn[y] = constrain( srvoPosn[y], 800, 1900);        
             OCR1B =  srvoPosn[y];              // Pin 10
            }
+           //Serial.print(srvoPosn[0]); 
+           //Serial.print("\t");
+           //Serial.println(srvoPosn[1]);           
          }  
        }       
              
+     // Debug mode
    if (Serial.available() > 0) {   
     incomingByte = Serial.read();
     // "i" command - print a table "raw" phases. "ii" print X and Y consequently.
